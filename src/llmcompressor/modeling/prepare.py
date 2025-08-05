@@ -1,6 +1,6 @@
 import tqdm
 import contextlib
-from compressed_tensors.utils import replace_module, match_named_modules
+from compressed_tensors.utils import replace_module, delete_offload_module, register_offload_module
 from transformers import PreTrainedModel
 
 from llmcompressor.modeling.deepseek_v3 import replace as replace_deepseekv3
@@ -47,22 +47,26 @@ def update_qwen3_moe(model, stack):
 
 def update_gpt_oss_moe(model: PreTrainedModel, stack):
     @contextlib.contextmanager
-    def replace_context(model, name, module):
+    def replace_context(parent, name, module):
         linear = GptOssExpertsLinear(module)
-        replace_module(model, name, linear)
         del module
+        delete_offload_module(parent, name)
+        register_offload_module(parent, name, linear)
 
         yield
 
         restored = linear.to_original()
-        replace_module(model, name, restored)
+        del linear
+        delete_offload_module(parent, name)
+        register_offload_module(parent, name, restored)
 
-    # TODO: need to think about duplicates
+    # TODO: need to consider when replace module is duplicated in structure
     modules = list(model.named_modules())
     for name, module in tqdm.tqdm(modules, desc="Checking modules for replacements"):
-        cls_name = module.__class__.__name__
-        if cls_name == "GptOssExperts":
-            stack.enter_context(replace_context(model, name, module))
+        children = list(module.named_children())
+        for child_name, child in children:
+            if child.__class__.__name__ == "GptOssExperts":
+                stack.enter_context(replace_context(module, child_name, child))
     
 
 
@@ -78,3 +82,27 @@ def moe_calibration_context(model: PreTrainedModel, stack):
     cls_name = model.__class__.__name__
     if cls_name in moe_context:
         moe_context.get(cls_name)(model, stack)
+
+
+
+# import torch
+# from accelerate.hooks import (
+#         AlignDevicesHook,
+# def replace_offload_module(base: torch.nn.Module, name: str, module: torch.nn.Module):
+#     hook = getattr(base, name)._hf_hook
+#     delete_offload_module(base, name)
+
+#     weights_map = PrefixedDataset(
+#         hook.weights_map.dataset, prefix=f"{hook.weights_map.prefix.remove_suffix(name + ".")}"
+#     )
+
+#     parent_hook = AlignDevicesHook(
+#         execution_device=hook.execution_device,
+#         offload=hook.offload,
+#         io_same_device=False,
+#         weights_map=weights_map,
+#         offload_buffers=offload_buffers,
+#         place_submodules=place_submodules,
+#         skip_keys=None,
+#         tied_params_map=hook.tied_params_map,
+#     )
