@@ -7,6 +7,8 @@ from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from llmcompressor.utils.dev import skip_weights_initialize
 
+from compressed_tensors import update_offload_parameter
+
 
 class GptOssExpert(torch.nn.Module):
     def __init__(self, hidden_size: int, expert_dim: int, alpha: float, limit: float):
@@ -56,18 +58,42 @@ class GptOssExpertsLinear(torch.nn.Module):
 
     def load_weights(self, experts: GptOssExperts):
         for expert_index, expert in enumerate(self.experts):
-            expert.gate_proj.weight.data = experts.gate_up_proj[expert_index, ..., ::2].data.T
-            expert.gate_proj.bias.data = experts.gate_up_proj_bias[expert_index, ..., ::2].data
+            update_offload_parameter(expert.gate_proj, "weight", experts.gate_up_proj[expert_index, ..., ::2].T)
+            update_offload_parameter(expert.gate_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., ::2])
 
-            expert.up_proj.weight.data = experts.gate_up_proj[expert_index, ..., 1::2].data.T
-            expert.up_proj.bias.data = experts.gate_up_proj_bias[expert_index, ..., 1::2].data
+            update_offload_parameter(expert.up_proj, "weight", experts.gate_up_proj[expert_index, ..., 1::2].T)
+            update_offload_parameter(expert.up_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., 1::2])
 
-            expert.down_proj.weight.data = experts.down_proj[expert_index].T
-            expert.down_proj.bias.data = experts.down_proj_bias[expert_index]
-
+            update_offload_parameter(expert.down_proj, "weight", experts.down_proj[expert_index].T)
+            update_offload_parameter(expert.down_proj, "bias", experts.down_proj_bias[expert_index])
 
     def to_original(self) -> GptOssExperts:
-        pass
+        with skip_weights_initialize():
+            fake_config = GptOssConfig(
+                intermediate_size=self.intermediate_size,
+                num_local_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+
+            )
+            experts = GptOssExperts(fake_config)
+
+        for expert_index, expert in enumerate(self.experts):
+            experts.gate_up_proj[expert_index, ..., ::2].data = expert.gate_proj.weight.data.T
+            experts.gate_up_proj_bias[expert_index, ..., ::2].data = expert.gate_proj.bias.data
+
+            experts.gate_up_proj[expert_index, ..., 1::2].data = expert.up_proj.weight.data.T
+            experts.gate_up_proj_bias[expert_index, ..., 1::2].data = expert.up_proj.bias.data
+
+            experts.down_proj[expert_index].data = expert.down_proj.weight.data.T
+            experts.down_proj_bias[expert_index] = expert.down_proj.bias.data
+
+        # update offloaded state dict
+        update_offload_parameter(experts, "gate_up_proj", experts.gate_up_proj)
+        update_offload_parameter(experts, "gate_up_proj_bias", experts.gate_up_proj_bias)
+        update_offload_parameter(experts, "down_proj", experts.down_proj)
+        update_offload_parameter(experts, "down_proj_bias", experts.down_proj_bias)
+
+        return experts
     
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
@@ -113,5 +139,8 @@ if __name__ == "__main__":
         linear = GptOssExpertsLinear(original)
         output = linear(input, routing_weights=routing_weights)
 
-        breakpoint()
         assert torch.allclose(output, true_output, atol=1e-3, rtol=0.0)
+
+        restored = linear.to_original()
+        restored_output = linear(input, routing_weights=routing_weights)
+        assert torch.allclose(restored_output, true_output, atol=1e-3, rtol=0.0)

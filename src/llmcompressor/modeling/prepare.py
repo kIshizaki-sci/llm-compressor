@@ -1,9 +1,11 @@
+import contextlib
 from compressed_tensors.utils import replace_module
 from transformers import PreTrainedModel
 
 from llmcompressor.modeling.deepseek_v3 import replace as replace_deepseekv3
 from llmcompressor.modeling.llama4 import replace as replace_llama4
 from llmcompressor.modeling.qwen3_moe import replace as replace_Qwen3MoE
+from llmcompressor.modeling.gpt_oss import GptOssExpertsLinear
 from llmcompressor.utils.helpers import patch_attr
 
 __all__ = ["replace_modules_for_calibration"]
@@ -42,13 +44,29 @@ def update_qwen3_moe(model, stack):
             )
 
 
-def update_gpt_oss_moe(model, stack):
-    
+def update_gpt_oss_moe(model: PreTrainedModel, stack):
+    @contextlib.contextmanager
+    def replace_context(model, name, module):
+        linear = GptOssExpertsLinear(module)
+        replace_module(model, name, linear)
+        del module
+
+        yield
+
+        restored = linear.to_original()
+        replace_module(model, name, restored)
+
+    # TODO: need to think about duplicates
+    for name, module in model.named_modules():
+        cls_name = module.__class__.__name__
+        if cls_name == "GptOssExpert":
+            stack.enter_context(replace_context(model, name, module))
     
 
 
 moe_context = {
     "Qwen3MoeForCausalLM": update_qwen3_moe,
+    "GptOssForCausalLM": update_gpt_oss_moe,
 }
 
 
