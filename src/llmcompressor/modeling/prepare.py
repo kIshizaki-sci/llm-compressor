@@ -42,6 +42,11 @@ def update_qwen3_moe(model, stack):
             )
 
 
+def update_gpt_oss_moe(model, stack):
+    
+    
+
+
 moe_context = {
     "Qwen3MoeForCausalLM": update_qwen3_moe,
 }
