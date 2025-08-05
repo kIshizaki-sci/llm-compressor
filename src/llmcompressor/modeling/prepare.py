@@ -1,5 +1,6 @@
+import tqdm
 import contextlib
-from compressed_tensors.utils import replace_module
+from compressed_tensors.utils import replace_module, match_named_modules
 from transformers import PreTrainedModel
 
 from llmcompressor.modeling.deepseek_v3 import replace as replace_deepseekv3
@@ -57,9 +58,10 @@ def update_gpt_oss_moe(model: PreTrainedModel, stack):
         replace_module(model, name, restored)
 
     # TODO: need to think about duplicates
-    for name, module in model.named_modules():
+    modules = list(model.named_modules())
+    for name, module in tqdm.tqdm(modules, desc="Checking modules for replacements"):
         cls_name = module.__class__.__name__
-        if cls_name == "GptOssExpert":
+        if cls_name == "GptOssExperts":
             stack.enter_context(replace_context(model, name, module))
     
 

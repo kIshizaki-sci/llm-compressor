@@ -7,10 +7,14 @@ from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from llmcompressor.utils.dev import skip_weights_initialize
 
-from compressed_tensors import update_offload_parameter
+from compressed_tensors.utils import update_offload_parameter, align_module_device
 
 
 class GptOssExpert(torch.nn.Module):
+    gate_proj: torch.nn.Linear
+    up_proj: torch.nn.Linear
+    down_proj: torch.nn.Linear
+
     def __init__(self, hidden_size: int, expert_dim: int, alpha: float, limit: float):
         super().__init__()
 
@@ -57,17 +61,21 @@ class GptOssExpertsLinear(torch.nn.Module):
         self.limit = experts.limit
 
     def load_weights(self, experts: GptOssExperts):
-        for expert_index, expert in enumerate(self.experts):
-            update_offload_parameter(expert.gate_proj, "weight", experts.gate_up_proj[expert_index, ..., ::2].T)
-            update_offload_parameter(expert.gate_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., ::2])
+        # TODO: this code is inefficient. If there was a "get_offloaded_data" util,
+        # we could avoid having to move from cpu -> gpu -> cpu
+        with align_module_device(experts):
+            for expert_index, expert in enumerate(self.experts):
+                update_offload_parameter(expert.gate_proj, "weight", experts.gate_up_proj[expert_index, ..., ::2].T)
+                update_offload_parameter(expert.gate_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., ::2])
 
-            update_offload_parameter(expert.up_proj, "weight", experts.gate_up_proj[expert_index, ..., 1::2].T)
-            update_offload_parameter(expert.up_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., 1::2])
+                update_offload_parameter(expert.up_proj, "weight", experts.gate_up_proj[expert_index, ..., 1::2].T)
+                update_offload_parameter(expert.up_proj, "bias", experts.gate_up_proj_bias[expert_index, ..., 1::2])
 
-            update_offload_parameter(expert.down_proj, "weight", experts.down_proj[expert_index].T)
-            update_offload_parameter(expert.down_proj, "bias", experts.down_proj_bias[expert_index])
+                update_offload_parameter(expert.down_proj, "weight", experts.down_proj[expert_index].T)
+                update_offload_parameter(expert.down_proj, "bias", experts.down_proj_bias[expert_index])
 
     def to_original(self) -> GptOssExperts:
+        # TODO: this doesn't really handle offloading or correct device placement
         with skip_weights_initialize():
             fake_config = GptOssConfig(
                 intermediate_size=self.intermediate_size,
@@ -78,14 +86,17 @@ class GptOssExpertsLinear(torch.nn.Module):
             experts = GptOssExperts(fake_config)
 
         for expert_index, expert in enumerate(self.experts):
-            experts.gate_up_proj[expert_index, ..., ::2].data = expert.gate_proj.weight.data.T
-            experts.gate_up_proj_bias[expert_index, ..., ::2].data = expert.gate_proj.bias.data
+            # TODO: this code is inefficient. If there was a "get_offloaded_data" util,
+            # we could avoid having to move from cpu -> gpu -> cpu
+            with align_module_device(expert):
+                experts.gate_up_proj[expert_index, ..., ::2].data = expert.gate_proj.weight.data.T
+                experts.gate_up_proj_bias[expert_index, ..., ::2].data = expert.gate_proj.bias.data
 
-            experts.gate_up_proj[expert_index, ..., 1::2].data = expert.up_proj.weight.data.T
-            experts.gate_up_proj_bias[expert_index, ..., 1::2].data = expert.up_proj.bias.data
+                experts.gate_up_proj[expert_index, ..., 1::2].data = expert.up_proj.weight.data.T
+                experts.gate_up_proj_bias[expert_index, ..., 1::2].data = expert.up_proj.bias.data
 
-            experts.down_proj[expert_index].data = expert.down_proj.weight.data.T
-            experts.down_proj_bias[expert_index] = expert.down_proj.bias.data
+                experts.down_proj[expert_index].data = expert.down_proj.weight.data.T
+                experts.down_proj_bias[expert_index] = expert.down_proj.bias.data
 
         # update offloaded state dict
         update_offload_parameter(experts, "gate_up_proj", experts.gate_up_proj)
@@ -134,6 +145,7 @@ if __name__ == "__main__":
             setattr(original, name, getattr(original, name).normal_())
 
         original.eval()
+        assert original.training == False
         true_output = original(input, routing_weights=routing_weights)
 
         linear = GptOssExpertsLinear(original)
